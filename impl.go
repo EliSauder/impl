@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -46,6 +47,87 @@ type Type struct {
 	// remain joined to the type name. So "foo[Bar, Baz[Quux]]" will be
 	// returned as {ID: "foo", Params: []string{"Bar", "Baz[Quux]"}}
 	Params []string
+}
+
+type Path struct {
+	Path string
+	Alias string
+}
+
+type PathType struct {
+	Type []rune
+	Module []rune
+	Path []rune
+	ModuleIsAlias bool
+	qualifiedType []rune
+	pathQualifiedType []rune
+	packageImport []rune
+}
+
+func (pt *PathType) GetPath() Path {
+	if pt.ModuleIsAlias {
+		return Path{
+			Path: string(pt.Path),
+			Alias: string(pt.Module),
+		}
+	}
+	return Path {
+		Path: string(pt.Path),
+	}
+}
+
+func (pt *PathType) PackageImport() []rune {
+	if len(pt.Path) == 0 {
+		return []rune{}
+	}
+
+	if len(pt.pathQualifiedType) > 0 {
+		return pt.packageImport
+	}
+
+	pt.packageImport = append(pt.packageImport, []rune("import ")...)
+	if pt.ModuleIsAlias {
+		pt.packageImport = append(pt.packageImport, pt.Module...)
+		pt.packageImport = append(pt.packageImport, []rune(" ")...)
+	}
+	pt.packageImport = append(pt.packageImport, []rune("\"")...)
+	pt.packageImport = append(pt.packageImport, pt.Path...)
+	pt.packageImport = append(pt.packageImport, []rune("\"")...)
+
+	return pt.packageImport
+}
+
+func (pt *PathType) PathQualifiedType() []rune {
+	if len(pt.pathQualifiedType) > 0 {
+		return pt.pathQualifiedType
+	}
+
+	if len(pt.Path) > 0 {
+		pt.pathQualifiedType = append(pt.pathQualifiedType, '"')
+		pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Path...)
+		if pt.ModuleIsAlias {
+			pt.pathQualifiedType = append(pt.pathQualifiedType, ';')
+			pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Module...)
+		}
+		pt.pathQualifiedType = append(pt.pathQualifiedType, '"', '.')
+	}
+	pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Type...)
+
+	return pt.pathQualifiedType
+}
+
+func (pt *PathType) ModuleQualifiedType() []rune {
+	if len(pt.Module) == 0 {
+		return pt.Type
+	}
+	if len(pt.qualifiedType) > 0 {
+		return pt.qualifiedType
+	}
+	pt.qualifiedType = append(pt.qualifiedType, pt.Module...)
+	pt.qualifiedType = append(pt.qualifiedType, '.')
+	pt.qualifiedType = append(pt.qualifiedType, pt.Type...)
+
+	return pt.qualifiedType
 }
 
 // String constructs a reference to the Type. For example:
@@ -98,55 +180,51 @@ func parseType(in string) (Type, error) {
 //   b. Grab all non-path characters (")
 //   c. Strip second quote
 // 3. etc
-func stripPaths(in string) (string, error) {
+func stripPaths(in string) (string, []PathType, error) {
 	remain := []rune(in)
 	out := make([]rune, 0, len(remain))
-	quotesRemoved := 0
+	pts := []PathType{}
 
 	for len(remain) > 0 {
+		var pt PathType
 		var seg []rune
 		var more bool
+		var err error
 
-		seg, remain, more = getPathSeg(remain)
-		out = append(out, seg...)
+		pt, remain, more, err = getPathSeg(remain)
+		if err != nil {
+			return "", []PathType{}, err
+		}
+		out = append(out, pt.ModuleQualifiedType()...)
+		if string(pt.Type) != "map" || len(pt.Module) != 0 {
+			pts = append(pts, pt)
+		}
 		if !more {
 			break
 		}
 
-		seg, remain, more = getNonPathSeg(remain, &quotesRemoved)
-		// Check for remaining quote in segment. This is to handle
-		// double quotes
-		if checkForQuote(seg) {
-			return "", fmt.Errorf("double quotes")
-		}
+		seg, remain, more = getNonPathSeg(remain)
 		out = append(out, seg...)
 		if !more {
 			break
 		}
 	}
 
-	// We want balanced quotes for our paths
-	if quotesRemoved % 2 != 0 {
-		return "", fmt.Errorf("unbalanced quotes")
+	for _, pt := range pts {
+		fmt.Printf("id: %s\r\n\timport: %s\r\n\ttype: %s\r\n", string(out), string(pt.PackageImport()), string(pt.PathQualifiedType()))
 	}
 
-	return string(out), nil
+	return string(out), pts, nil
 }
 
-func getNonPathSeg(runes []rune, quotesRemoved *int) (seg []rune, remain []rune, more bool) {
+func getNonPathSeg(runes []rune)  (seg []rune, remain []rune, more bool) {
 	// Get index of next path character
-	n := slices.IndexFunc(runes, isPathRune)
+	n := slices.IndexFunc(runes, isQuotedAliasPathString)
 	// Copy all characters before the path character
 	seg = runes
 	if n >= 0 {
 		seg = seg[:n]
 	}
-	// Trim a quote from the segment
-	lenPreTrim := len(seg)
-	seg = trimPathSeg(seg)
-	// If a quote was removed, increment the number of quotes removed
-	// This is for checking that the quotations are balanced
-	*quotesRemoved += lenPreTrim - len(seg)
 	// If there are no path like characters, we are done
 	if n == -1 {
 		return seg, []rune{}, false
@@ -155,25 +233,144 @@ func getNonPathSeg(runes []rune, quotesRemoved *int) (seg []rune, remain []rune,
 	return seg, remain, true
 }
 
-func getPathSeg(runes []rune) (seg []rune, remain []rune, more bool) {
+func getPathSeg(runes []rune) (pt PathType, remain []rune, more bool, err error) {
 	// Find first index of a non-path character
-	n := slices.IndexFunc(runes, isNonPathRune)
+	n := slices.IndexFunc(runes, isNotQuotedAliasPathString)
 	// Get characters up to the non-path character
-	seg = runes
+	seg := runes
 	if n >= 0 {
 		seg = seg[:n]
 	}
-	// If there is a path separator, get the segment at
-	// the end of the path
-	if slash := lastIndex(seg, '/'); slash >= 0 {
-		seg = seg[slash+1:]
+	pt, err = parsePathAndType(seg)
+	if err != nil {
+		return pt, []rune{}, false, err
 	}
+
 	// if there is no non-path like characters, we are done
 	if n == -1 {
-		return seg, []rune{}, false
+		return pt, []rune{}, false, nil
 	}
 	remain = runes[n:]
-	return seg, remain, true
+	return pt, remain, true, nil
+}
+
+func parsePathAndType(seg []rune) (PathType, error) {
+	if len(seg) == 0 {
+		return PathType{}, errors.New("expected content in segment")
+	}
+
+	loc, err := pathRuneLocations(seg)
+	if err != nil {
+		return PathType{}, err
+	}
+
+	hasModule := loc.typeQualifierRune >= 0
+	hasPath := loc.lastPathSegRune >= 0
+	hasAlias := loc.aliasSegRune >= 0
+
+	typeStart := loc.typeQualifierRune + 1
+
+	moduleStart := max(loc.aliasSegRune, loc.lastPathSegRune, loc.firstQuote) + 1
+	moduleEnd := useInOrder(loc.lastQuote, loc.typeQualifierRune)
+
+	pathStart := loc.firstQuote + 1
+	pathEnd := useInOrder(loc.aliasSegRune, loc.lastQuote, loc.typeQualifierRune)
+
+
+	var typ []rune = seg[typeStart:]
+	var mod []rune
+	var path []rune
+
+	if hasModule {
+		mod = seg[moduleStart:moduleEnd]
+	}
+	if hasPath {
+		path = seg[pathStart:pathEnd]
+	}
+
+	return PathType{
+		Type: typ,
+		Module: mod,
+		Path: path,
+		ModuleIsAlias: hasAlias,
+	}, nil
+}
+
+type pathDetails struct {
+	lastPathSegRune int
+	aliasSegRune int
+	typeQualifierRune int
+	firstQuote int
+	lastQuote int
+}
+
+func pathRuneLocations(seg []rune) (pathDetails, error) {
+	if len(seg) == 0{
+		return pathDetails{}, errors.New("no segment to read for path or type")
+	}
+	lastPathSeg := -1
+	typeQualifierRune := -1
+	aliasSegRune := -1
+	firstQuote := -1
+	lastQuote := -1
+	numQuotes := 0
+
+	for i, r := range seg {
+		switch r {
+		case '/':
+			lastPathSeg = i
+		case '.':
+			typeQualifierRune = i
+		case '"':
+			numQuotes += 1
+			if firstQuote == -1 {
+				firstQuote = i
+			}
+			lastQuote = i
+		case ';':
+			if aliasSegRune != -1 {
+				return pathDetails{}, errors.New("unexpected second alias")
+			}
+			aliasSegRune = i
+		}
+	}
+	if typeQualifierRune == len(seg) - 1 {
+		return pathDetails{}, errors.New("no type provided in path")
+	}
+	if numQuotes != 0 && numQuotes != 2 {
+		return pathDetails{}, errors.New("unexpected number of quotes, expected 0 or 2")
+	}
+	if typeQualifierRune < 0 && lastPathSeg > 0 {
+		return pathDetails{}, errors.New("type must be qualified when providing its path")
+	}
+	// type qualifier should not be between quotes and should be after the
+	// last path separator
+	if (lastQuote > 0 && typeQualifierRune != lastQuote + 1) ||
+		typeQualifierRune < lastPathSeg {
+		return pathDetails{}, errors.New("expected type qualifier after path")
+	}
+
+	if numQuotes > 0 && firstQuote != 0 {
+		return pathDetails{}, errors.New("when using quoted paths, quote must start path")
+	}
+
+	return pathDetails{
+		lastPathSegRune: lastPathSeg,
+		aliasSegRune: aliasSegRune,
+		typeQualifierRune: typeQualifierRune,
+		firstQuote: firstQuote,
+		lastQuote: lastQuote,
+	}, nil
+}
+
+
+func useInOrder(vals ...int) int {
+	for _, val := range vals {
+		if val >= 0 {
+			return val
+		}
+	}
+	return vals[len(vals)-1]
 }
 
 func checkForQuote(p []rune) bool {
@@ -215,6 +412,18 @@ func isPathRune(r rune) bool {
 	return unicode.IsPrint(r) && !strings.ContainsRune(" \uFFFD!\"#$%&'()*,:;<=>?[\\]^`{|}", r)
 }
 
+func isQuotedAliasPathString(r rune) bool {
+	return isPathRune(r) || r == '"' || r == ';'
+}
+
+func isNotQuotedAliasPathString(r rune) bool {
+	return !isQuotedAliasPathString(r)
+}
+
+func isPathTerminatingCharacter(r rune) bool {
+	return strings.ContainsRune("=!?: \uFFFD", r)
+}
+
 func isNonPathRune(r rune) bool {
 	return !isPathRune(r)
 }
@@ -231,104 +440,102 @@ func isNonPathRune(r rune) bool {
 // Generic types will have their type params set in the Params property of
 // the Type. Input should always reference generic types with their parameters
 // specified: GenericType[string, bool], not GenericType[A any, B comparable].
-func findInterface(input string, srcDir string) (path string, iface Type, err error) {
+func findInterface(input string, srcDir string) ([]Path, Type, error) {
 	if len(strings.Fields(input)) != 1 && !strings.Contains(input, "[") {
-		return "", Type{}, fmt.Errorf("couldn't parse interface: %s", input)
+		return []Path{}, Type{}, fmt.Errorf("couldn't parse interface: %s", input)
 	}
 
 	srcPath := filepath.Join(srcDir, "__go_impl__.go")
 
 	// Find the base type (without generic params) to extract package path.
 	// This handles cases like: pkg.Interface[other/pkg.Type]
-	baseInput := input
-	if bracket := strings.Index(input, "["); bracket > -1 {
-		baseInput = input[:bracket]
+	//baseInput := input
+	//if bracket := strings.Index(input, "["); bracket > -1 {
+	//	baseInput = input[:bracket]
+	//}
+
+	id, pts, err := stripPaths(input)
+	if err != nil {
+		return []Path{}, Type{}, err
+	}
+	iface, err := parseType(id)
+	if err != nil {
+		return []Path{}, Type{}, err
 	}
 
-	if slash := strings.LastIndex(baseInput, "/"); slash > -1 {
-		// package path provided: expect "path/to/pkg.TypeName"
-		// make sure iface does not end with "/" (e.g. reject net/http/)
-		if slash+1 == len(baseInput) {
-			return "", Type{}, fmt.Errorf("interface name cannot end with a '/' character: %s", input)
+	paths := make([]Path, 0, len(pts))
+
+	countWithoutPath := 0
+
+	for _, pt := range pts {
+		if len(pt.Path) != 0 {
+			paths = append(paths, pt.GetPath())
+			continue
 		}
-		dot := strings.LastIndex(baseInput, ".")
-		// make sure iface does not end with "." (e.g. reject net/http.)
-		if dot+1 == len(baseInput) {
-			return "", Type{}, fmt.Errorf("interface name cannot end with a '.' character: %s", input)
-		}
-		// make sure iface has at least one "." after "/" (e.g. reject net/http/httputil)
-		if dot <= slash {
-			return "", Type{}, fmt.Errorf("invalid interface name: %s", input)
-		}
-		path = strings.Trim(baseInput[:dot], "\"")
-		id, err := stripPaths(input[dot+1:])
-		if err != nil {
-			return "", Type{}, err
-		}
-		iface, err = parseType(id)
-		if err != nil {
-			return "", Type{}, err
-		}
-		return path, iface, nil
+		countWithoutPath++
 	}
 
-	src := []byte("package hack\n" + "var i " + input)
-	// If we couldn't determine the import path, goimports will
-	// auto fix the import path.
+	if countWithoutPath == 0 {
+		return paths, iface, nil
+	}
+
+	iface, paths, err = autoMagicImport(id, srcPath, paths)
+	if err != nil {
+		return []Path{}, Type{}, err
+	}
+
+	return paths, iface, nil
+
+}
+
+func autoMagicImport(typ string, srcPath string, paths []Path) (Type, []Path, error) {
+	src := []byte("package automagicimport\nimport (")
+	for _, p := range paths {
+		src = append(src, '"')
+		src = append(src, p.Path...)
+		src = append(src, "\"\n"...)
+	}
+	src = append(src, ([]byte(")\nvar i " + typ))...)
+
 	imp, err := imports.Process(srcPath, src, nil)
 	if err != nil {
-		return "", Type{}, fmt.Errorf("couldn't parse interface: %s", input)
+		return Type{}, []Path{}, err
 	}
 
-	// imp should now contain an appropriate import.
-	// Parse out the import and the identifier.
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, srcPath, imp, 0)
 	if err != nil {
-		panic(err)
+		return Type{}, []Path{}, err
 	}
 
-	qualified := strings.Contains(input, ".")
+	qualified := strings.Contains(typ, ".")
 
 	if len(f.Imports) == 0 && qualified {
-		return "", Type{}, fmt.Errorf("unrecognized interface: %s", input)
+		return Type{}, []Path{}, fmt.Errorf("unrecognized type: %s", typ)
 	}
 
-	if !qualified {
-		// If !qualified, the code looks like:
-		//
-		// package hack
-		//
-		// var i Reader
-		decl := f.Decls[0].(*ast.GenDecl)      // var i Reader
-		spec := decl.Specs[0].(*ast.ValueSpec) // i Reader
-		iface, err = typeFromAST(spec.Type)
-		return path, iface, err
+	paths = make([]Path, 0, len(paths))
+
+	for _, i := range f.Imports {
+		imp := i.Path.Value
+		imp, err := strconv.Unquote(imp)
+		if err != nil {
+			return Type{}, []Path{}, err
+		}
+		paths = append(paths, Path{Path:imp})
 	}
 
-	// If qualified, the code looks like:
-	//
-	// package hack
-	//
-	// import (
-	//   "io"
-	// )
-	//
-	// var i io.Reader
-	raw := f.Imports[0].Path.Value   // "io"
-	path, err = strconv.Unquote(raw) // io
+	decl := f.Decls[len(f.Decls)-1].(*ast.GenDecl)
+	spec := decl.Specs[0].(*ast.ValueSpec) 	// i <type>
+
+	iface, err := typeFromAST(spec.Type)
 	if err != nil {
-		panic(err)
+		return Type{}, []Path{}, err
 	}
-	decl := f.Decls[1].(*ast.GenDecl)      // var i io.Reader
-	spec := decl.Specs[0].(*ast.ValueSpec) // i io.Reader
-	iface, err = typeFromAST(spec.Type)
-	if err != nil {
-		return path, iface, fmt.Errorf("error parsing type from AST: %w", err)
-	}
-	// trim off the package which got smooshed on when resolving the type
+
 	_, iface.Name, _ = strings.Cut(iface.Name, ".")
-	return path, iface, err
+
+	return iface, paths, err
 }
 
 func typeFromAST(in ast.Expr) (Type, error) {
@@ -597,7 +804,7 @@ func funcs(iface, srcDir, recvPkg string, comments EmitComments) ([]Func, error)
 	}
 
 	// Parse the package and find the interface declaration.
-	p, spec, err := typeSpec(path, typ, srcDir)
+	p, spec, err := typeSpec(path[0].Path, typ, srcDir)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s not found: %s", iface, err)
 	}
