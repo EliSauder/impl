@@ -12,9 +12,9 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -34,6 +34,7 @@ type Type struct {
 	// Name is the type's name. For example, in "foo[Bar, Baz]", the name
 	// is "foo".
 	Name string
+	Path Path
 
 	// Params are the type's type params. For example, in "foo[Bar, Baz]",
 	// the Params are []string{"Bar", "Baz"}.
@@ -46,86 +47,79 @@ type Type struct {
 	// type; if the params themselves have type parameters, they will
 	// remain joined to the type name. So "foo[Bar, Baz[Quux]]" will be
 	// returned as {ID: "foo", Params: []string{"Bar", "Baz[Quux]"}}
-	Params []string
+	Params []Type
 }
 
 type Path struct {
 	Path string
-	Alias string
+	Module string
+	ModuleIsAlias bool
+}
+
+func (p *Path) ImportString() string {
+	if p.ModuleIsAlias {
+		return p.Module + " \"" + p.Path + "\""
+	}
+	return "\"" + p.Path + "\""
 }
 
 type PathType struct {
-	Type []rune
-	Module []rune
-	Path []rune
+	Type string
+	Module string
+	Path string
 	ModuleIsAlias bool
-	qualifiedType []rune
-	pathQualifiedType []rune
-	packageImport []rune
+	qualifiedType string
+	pathQualifiedType string
+	packageImport string
 }
+
+type ModulePathMap map[string]Path
 
 func (pt *PathType) GetPath() Path {
-	if pt.ModuleIsAlias {
-		return Path{
-			Path: string(pt.Path),
-			Alias: string(pt.Module),
-		}
-	}
-	return Path {
-		Path: string(pt.Path),
+	return Path{
+		Path: pt.Path,
+		Module: pt.Module,
+		ModuleIsAlias: pt.ModuleIsAlias,
 	}
 }
 
-func (pt *PathType) PackageImport() []rune {
-	if len(pt.Path) == 0 {
-		return []rune{}
-	}
 
-	if len(pt.pathQualifiedType) > 0 {
-		return pt.packageImport
-	}
-
-	pt.packageImport = append(pt.packageImport, []rune("import ")...)
-	if pt.ModuleIsAlias {
-		pt.packageImport = append(pt.packageImport, pt.Module...)
-		pt.packageImport = append(pt.packageImport, []rune(" ")...)
-	}
-	pt.packageImport = append(pt.packageImport, []rune("\"")...)
-	pt.packageImport = append(pt.packageImport, pt.Path...)
-	pt.packageImport = append(pt.packageImport, []rune("\"")...)
-
-	return pt.packageImport
-}
-
-func (pt *PathType) PathQualifiedType() []rune {
+func (pt *PathType) PathQualifiedType() string {
 	if len(pt.pathQualifiedType) > 0 {
 		return pt.pathQualifiedType
 	}
 
+	b := strings.Builder{}
+
 	if len(pt.Path) > 0 {
-		pt.pathQualifiedType = append(pt.pathQualifiedType, '"')
-		pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Path...)
+		b.WriteRune('"')
+		b.WriteString(pt.Path)
 		if pt.ModuleIsAlias {
-			pt.pathQualifiedType = append(pt.pathQualifiedType, ';')
-			pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Module...)
+			b.WriteRune(';')
+			b.WriteString(pt.Module)
 		}
-		pt.pathQualifiedType = append(pt.pathQualifiedType, '"', '.')
+		b.WriteString("\".")
 	}
-	pt.pathQualifiedType = append(pt.pathQualifiedType, pt.Type...)
+	b.WriteString(pt.Type)
+
+	pt.pathQualifiedType = b.String()
 
 	return pt.pathQualifiedType
 }
 
-func (pt *PathType) ModuleQualifiedType() []rune {
+func (pt *PathType) ModuleQualifiedType() string {
 	if len(pt.Module) == 0 {
 		return pt.Type
 	}
 	if len(pt.qualifiedType) > 0 {
 		return pt.qualifiedType
 	}
-	pt.qualifiedType = append(pt.qualifiedType, pt.Module...)
-	pt.qualifiedType = append(pt.qualifiedType, '.')
-	pt.qualifiedType = append(pt.qualifiedType, pt.Type...)
+	b := strings.Builder{}
+	b.WriteString(pt.Module)
+	b.WriteRune('.')
+	b.WriteString(pt.Type)
+
+	pt.qualifiedType = b.String()
 
 	return pt.qualifiedType
 }
@@ -135,10 +129,17 @@ func (pt *PathType) ModuleQualifiedType() []rune {
 // would yield
 // Foo[Bar, Baz[[]Quux]]
 func (t Type) String() string {
-	if len(t.Params) < 1 {
+	if len(t.Params) == 0 {
 		return t.Name
 	}
-	return t.Name + "[" + strings.Join(t.Params, ", ") + "]"
+	b:= strings.Builder{}
+	b.WriteRune('[')
+	for _, p := range t.Params {
+		b.WriteString(p.Name)
+		b.WriteString(", ")
+	}
+	finstr := b.String()
+	return finstr[:len(finstr)-1] + "]"
 }
 
 // parseType parses an interface reference into a Type, allowing us to
@@ -180,81 +181,118 @@ func parseType(in string) (Type, error) {
 //   b. Grab all non-path characters (")
 //   c. Strip second quote
 // 3. etc
-func stripPaths(in string) (string, []PathType, error) {
-	remain := []rune(in)
-	out := make([]rune, 0, len(remain))
-	pts := []PathType{}
+func parsePaths(in string) (string, ModulePathMap, error) {
+	remain := in
+	out := strings.Builder{}
+	mpm := ModulePathMap{}
 
-	for len(remain) > 0 {
-		var pt PathType
-		var seg []rune
-		var more bool
+	for len(in) > 0 {
+		var done bool
 		var err error
+		var pt PathType
 
-		pt, remain, more, err = getPathSeg(remain)
+		pt,remain,done,err = getPathSeg(remain)
 		if err != nil {
-			return "", []PathType{}, err
+			return "", nil, err
 		}
-		out = append(out, pt.ModuleQualifiedType()...)
-		if string(pt.Type) != "map" || len(pt.Module) != 0 {
-			pts = append(pts, pt)
+		if len(pt.Path) > 0 {
+			mpm[pt.Module] = pt.GetPath()
 		}
-		if !more {
+
+		out.WriteString(pt.ModuleQualifiedType())
+		if done {
 			break
 		}
 
-		seg, remain, more = getNonPathSeg(remain)
-		out = append(out, seg...)
-		if !more {
+		var seg string
+		seg, remain, done = getNonPathSeg(remain)
+		out.WriteString(seg)
+		if done {
 			break
 		}
 	}
 
-	for _, pt := range pts {
-		fmt.Printf("id: %s\r\n\timport: %s\r\n\ttype: %s\r\n", string(out), string(pt.PackageImport()), string(pt.PathQualifiedType()))
-	}
-
-	return string(out), pts, nil
+	return out.String(), mpm, nil
 }
 
-func getNonPathSeg(runes []rune)  (seg []rune, remain []rune, more bool) {
+//func stripPaths(in string) (string, []PathType, error) {
+//	remain := []rune(in)
+//	out := make([]rune, 0, len(remain))
+//	pts := []PathType{}
+//
+//	for len(remain) > 0 {
+//		var pt PathType
+//		var seg []rune
+//		var more bool
+//		var err error
+//
+//		pt, remain, more, err = getPathSeg(remain)
+//		if err != nil {
+//			return "", []PathType{}, err
+//		}
+//		out = append(out, pt.ModuleQualifiedType()...)
+//		typStr := string(pt.Type)
+//		fmt.Printf("handling type str: %s\r\n", typStr)
+//		if (typStr != "map" && typStr != "func" && typStr != "chan") {
+//			fmt.Print("- appending\r\n")
+//			pts = append(pts, pt)
+//		}
+//		if !more {
+//			break
+//		}
+//
+//		seg, remain, more = getNonPathSeg(remain)
+//		out = append(out, seg...)
+//		if !more {
+//			break
+//		}
+//	}
+//
+//	for _, pt := range pts {
+//		fmt.Printf("id: %s\r\n\timport: %s\r\n\ttype: %s\r\n", string(out), string(pt.PackageImport()), string(pt.PathQualifiedType()))
+//	}
+//
+//	return string(out), pts, nil
+//}
+
+func getNonPathSeg(in string)  (seg string, remain string, done bool) {
 	// Get index of next path character
-	n := slices.IndexFunc(runes, isQuotedAliasPathString)
+	n := strings.IndexFunc(in, isQuotedAliasPathString)
 	// Copy all characters before the path character
-	seg = runes
+	seg = in
 	if n >= 0 {
 		seg = seg[:n]
 	}
 	// If there are no path like characters, we are done
 	if n == -1 {
-		return seg, []rune{}, false
+		return seg, "", true
 	}
-	remain = runes[n:]
-	return seg, remain, true
+	remain = in[n:]
+	return seg, remain, false
 }
 
-func getPathSeg(runes []rune) (pt PathType, remain []rune, more bool, err error) {
+func getPathSeg(in string) (pt PathType, remain string, done bool, err error) {
 	// Find first index of a non-path character
-	n := slices.IndexFunc(runes, isNotQuotedAliasPathString)
+	n := strings.IndexFunc(in, isNotQuotedAliasPathString)
 	// Get characters up to the non-path character
-	seg := runes
+	seg := in
 	if n >= 0 {
 		seg = seg[:n]
 	}
 	pt, err = parsePathAndType(seg)
 	if err != nil {
-		return pt, []rune{}, false, err
+		return pt, "", false, err
 	}
 
 	// if there is no non-path like characters, we are done
 	if n == -1 {
-		return pt, []rune{}, false, nil
+		return pt, "", true, nil
 	}
-	remain = runes[n:]
-	return pt, remain, true, nil
+	remain = in[n:]
+	return pt, remain, false, nil
 }
 
-func parsePathAndType(seg []rune) (PathType, error) {
+func parsePathAndType(seg string) (PathType, error) {
 	if len(seg) == 0 {
 		return PathType{}, errors.New("expected content in segment")
 	}
@@ -270,16 +308,18 @@ func parsePathAndType(seg []rune) (PathType, error) {
 
 	typeStart := loc.typeQualifierRune + 1
 
+	// TODO: Handle version
 	moduleStart := max(loc.aliasSegRune, loc.lastPathSegRune, loc.firstQuote) + 1
-	moduleEnd := useInOrder(loc.lastQuote, loc.typeQualifierRune)
+	moduleEnd := useInOrder(loc.versionPathSegRune, loc.lastQuote, loc.typeQualifierRune)
 
+	// TODO: Handle version
 	pathStart := loc.firstQuote + 1
 	pathEnd := useInOrder(loc.aliasSegRune, loc.lastQuote, loc.typeQualifierRune)
 
 
-	var typ []rune = seg[typeStart:]
-	var mod []rune
-	var path []rune
+	var typ string = seg[typeStart:]
+	var mod string
+	var path string
 
 	if hasModule {
 		mod = seg[moduleStart:moduleEnd]
@@ -298,13 +338,14 @@ func parsePathAndType(seg []rune) (PathType, error) {
 
 type pathDetails struct {
 	lastPathSegRune int
+	versionPathSegRune int
 	aliasSegRune int
 	typeQualifierRune int
 	firstQuote int
 	lastQuote int
 }
 
-func pathRuneLocations(seg []rune) (pathDetails, error) {
+func pathRuneLocations(seg string) (pathDetails, error) {
 	if len(seg) == 0{
 		return pathDetails{}, errors.New("no segment to read for path or type")
 	}
@@ -354,13 +395,56 @@ func pathRuneLocations(seg []rune) (pathDetails, error) {
 		return pathDetails{}, errors.New("when using quoted paths, quote must start path")
 	}
 
-	return pathDetails{
+	pd := pathDetails{
 		lastPathSegRune: lastPathSeg,
 		aliasSegRune: aliasSegRune,
 		typeQualifierRune: typeQualifierRune,
 		firstQuote: firstQuote,
 		lastQuote: lastQuote,
-	}, nil
+		versionPathSegRune: -1,
+	}
+
+	pd = handlePathVersion(seg, pd);
+
+	return pd, nil
+}
+
+func handlePathVersion(seg string, pd pathDetails) pathDetails {
+	// If we have an alias, the alias will deal with the version
+	if pd.aliasSegRune >= 0 {
+		fmt.Printf("path has alias, not checking version\r\n")
+		return pd
+	}
+	// If there is no path or module, we don't need to deal with version
+	if pd.lastPathSegRune < 0 || pd.typeQualifierRune < 0 {
+		fmt.Printf("no module, not checking version\r\n")
+		return pd
+	}
+
+	mod := seg[pd.lastPathSegRune+1:pd.typeQualifierRune]
+	// the module needs to be at least 2 characters to be a major
+	// version suffix
+	if len(mod) < 2 {
+		fmt.Printf("segment is less than 2, not version, %s\r\n", mod)
+		return pd
+	}
+	// The first character for a major version suffix needs to be a v
+	if mod[0] != 'v' {
+		fmt.Printf("seg doesn't start with version: %s\r\n", mod)
+		return pd
+	}
+	_, err := strconv.Atoi(mod[1:])
+	// If the rest of the module is not a number it is not a version
+	if err != nil {
+		fmt.Printf("seg after version is not number: %s\r\n", mod)
+		return pd
+	}
+
+	pd.versionPathSegRune = pd.lastPathSegRune
+	fmt.Printf("old last path seg rune: %d", pd.lastPathSegRune)
+	pd.lastPathSegRune = strings.LastIndex(seg[:pd.lastPathSegRune], "/")
+	fmt.Printf("new last path seg rune: %d", pd.lastPathSegRune)
+	return pd
 }
 
 
@@ -440,102 +524,154 @@ func isNonPathRune(r rune) bool {
 // Generic types will have their type params set in the Params property of
 // the Type. Input should always reference generic types with their parameters
 // specified: GenericType[string, bool], not GenericType[A any, B comparable].
-func findInterface(input string, srcDir string) ([]Path, Type, error) {
+func findInterface(input string, srcDir string) (Type, error) {
 	if len(strings.Fields(input)) != 1 && !strings.Contains(input, "[") {
-		return []Path{}, Type{}, fmt.Errorf("couldn't parse interface: %s", input)
+		return Type{}, fmt.Errorf("couldn't parse interface: %s", input)
 	}
 
 	srcPath := filepath.Join(srcDir, "__go_impl__.go")
 
-	// Find the base type (without generic params) to extract package path.
-	// This handles cases like: pkg.Interface[other/pkg.Type]
-	//baseInput := input
-	//if bracket := strings.Index(input, "["); bracket > -1 {
-	//	baseInput = input[:bracket]
-	//}
-
-	id, pts, err := stripPaths(input)
+	id, mpm, err := parsePaths(input)
 	if err != nil {
-		return []Path{}, Type{}, err
+		return Type{}, err
 	}
 	iface, err := parseType(id)
 	if err != nil {
-		return []Path{}, Type{}, err
+		return Type{}, err
 	}
 
-	paths := make([]Path, 0, len(pts))
-
-	countWithoutPath := 0
-
-	for _, pt := range pts {
-		if len(pt.Path) != 0 {
-			paths = append(paths, pt.GetPath())
-			continue
-		}
-		countWithoutPath++
-	}
-
-	if countWithoutPath == 0 {
-		return paths, iface, nil
-	}
-
-	iface, paths, err = autoMagicImport(id, srcPath, paths)
+	iface, err = autoMagicImport(id, srcPath, mpm)
 	if err != nil {
-		return []Path{}, Type{}, err
+		return Type{}, err
 	}
 
-	return paths, iface, nil
-
+	return iface, nil
 }
 
-func autoMagicImport(typ string, srcPath string, paths []Path) (Type, []Path, error) {
-	src := []byte("package automagicimport\nimport (")
-	for _, p := range paths {
-		src = append(src, '"')
-		src = append(src, p.Path...)
-		src = append(src, "\"\n"...)
+func populatePaths(typ *Type, mapping map[string]Path) {
+	fmt.Printf("calling with %s\r\n", typ.Name)
+	if typ == nil {
+		return
 	}
-	src = append(src, ([]byte(")\nvar i " + typ))...)
+	modName, typName, found := strings.Cut(typ.Name, ".")
+	var isPtr bool
+	if len(modName) > 0 {
+		isPtr = modName[0] == '*'
+	}
+	if isPtr {
+		modName = modName[1:]
+	}
+
+	if found {
+		val, ok := mapping[modName]
+		if ok {
+			typ.Path = val
+		}
+		typ.Name = typName
+	}
+	if isPtr && len(typ.Name) > 0 && typ.Name[0] != '*' {
+		typ.Name = "*" + typ.Name
+	}
+
+	for i, _ := range typ.Params {
+		populatePaths(&typ.Params[i], mapping)
+	}
+}
+
+func generateFileContent(typ string, mpm ModulePathMap) []byte {
+	b := strings.Builder{}
+	b.WriteString("package automagicimport\n")
+	if len(mpm) >= 0 {
+		b.WriteString("import(\n")
+		for _, v := range mpm {
+			b.WriteString(v.ImportString())
+			b.WriteRune('\n')
+		}
+		b.WriteString(")\n")
+	}
+	b.WriteString("var i ")
+	b.WriteString(typ)
+
+	fmt.Printf("---src---\r\n%s\r\n---end src---\r\n", b.String())
+
+	return []byte(b.String())
+}
+
+func autoMagicImport(typ string, srcPath string, mpm ModulePathMap) (Type, error) {
+
+	fmt.Printf("type: %s\r\n", typ)
+
+	src := generateFileContent(typ, mpm)
 
 	imp, err := imports.Process(srcPath, src, nil)
 	if err != nil {
-		return Type{}, []Path{}, err
+		return Type{}, err
 	}
+	fmt.Printf("---imports---\r\n%s\r\n---end imports---\r\n", imp)
 
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, srcPath, imp, 0)
 	if err != nil {
-		return Type{}, []Path{}, err
+		return Type{}, err
 	}
 
 	qualified := strings.Contains(typ, ".")
 
 	if len(f.Imports) == 0 && qualified {
-		return Type{}, []Path{}, fmt.Errorf("unrecognized type: %s", typ)
+		return Type{}, fmt.Errorf("unrecognized type: %s", typ)
 	}
 
-	paths = make([]Path, 0, len(paths))
-
-	for _, i := range f.Imports {
-		imp := i.Path.Value
-		imp, err := strconv.Unquote(imp)
-		if err != nil {
-			return Type{}, []Path{}, err
-		}
-		paths = append(paths, Path{Path:imp})
+	mpmtmp, err := getPathsFromFile(f)
+	if err != nil {
+		return Type{}, err
 	}
+
+	maps.Copy(mpm, mpmtmp)
 
 	decl := f.Decls[len(f.Decls)-1].(*ast.GenDecl)
 	spec := decl.Specs[0].(*ast.ValueSpec) 	// i <type>
 
 	iface, err := typeFromAST(spec.Type)
 	if err != nil {
-		return Type{}, []Path{}, err
+		return Type{}, err
 	}
 
-	_, iface.Name, _ = strings.Cut(iface.Name, ".")
+	populatePaths(&iface, mpm)
 
-	return iface, paths, err
+	return iface, err
+}
+
+func getPathsFromFile(f *ast.File) (ModulePathMap, error) {
+	mpm := ModulePathMap{}
+
+	for _, i := range f.Imports {
+		imp, err := strconv.Unquote(i.Path.Value)
+		if err != nil {
+			return nil, err
+		}
+
+		var mod string
+		lastPathSeg := strings.LastIndex(imp, "/")
+		if lastPathSeg < 0 {
+			mod = imp
+		} else if len(imp) > lastPathSeg+1 {
+			mod = imp[lastPathSeg+1:]
+		}
+
+		aliasIdent := i.Name
+		if aliasIdent != nil {
+			mod = aliasIdent.String()
+		}
+
+		fmt.Printf("creating path: Path: %s, Alias: %t, Module: %s\r\n", imp, aliasIdent != nil, mod)
+		mpm[mod] = Path{
+			Path: imp,
+			ModuleIsAlias: aliasIdent != nil,
+			Module: mod,
+		}
+	}
+
+	return mpm, nil
 }
 
 func typeFromAST(in ast.Expr) (Type, error) {
@@ -566,16 +702,18 @@ func typeFromAST(in ast.Expr) (Type, error) {
 			if err != nil {
 				return Type{}, err
 			}
-			res.Params = append(res.Params, param.String())
+			res.Params = append(res.Params, param)
 		}
 		return res, nil
 	}
 	// Non-generic type.
-	buf := new(strings.Builder)
-	err := format.Node(buf, token.NewFileSet(), in)
+	buf := strings.Builder{}
+	err := format.Node(&buf, token.NewFileSet(), in)
 	if err != nil {
 		return Type{}, err
 	}
+
+	fmt.Printf("typeFromAST: %s\r\n", buf.String())
 	return Type{Name: buf.String()}, nil
 }
 
@@ -591,30 +729,32 @@ type Pkg struct {
 type Spec struct {
 	*ast.TypeSpec
 	ast.CommentMap
-	TypeParams map[string]string
+	TypeParams map[string]Type
 }
 
 // typeSpec locates the *ast.TypeSpec for type id in the import path.
-func typeSpec(path string, typ Type, srcDir string) (Pkg, Spec, error) {
+func typeSpec(typ Type, srcDir string) (Pkg, Spec, error) {
 	var pkg *build.Package
 	var err error
 
-	if path == "" {
+	if len(typ.Path.Path) == 0 {
 		pkg, err = build.ImportDir(srcDir, 0)
 		if err != nil {
 			return Pkg{}, Spec{}, fmt.Errorf("couldn't find package in %s: %v", srcDir, err)
 		}
 	} else {
-		pkg, err = build.Import(path, srcDir, 0)
+		pkg, err = build.Import(typ.Path.Path, srcDir, 0)
 		if err != nil {
-			return Pkg{}, Spec{}, fmt.Errorf("couldn't find package %s: %v", path, err)
+			return Pkg{}, Spec{}, fmt.Errorf("couldn't find package %s: %v", typ.Path.Path, err)
 		}
 	}
 
 	fset := token.NewFileSet() // share one fset across the whole package
+
 	var files []string
 	files = append(files, pkg.GoFiles...)
 	files = append(files, pkg.CgoFiles...)
+
 	for _, file := range files {
 		f, err := parser.ParseFile(fset, filepath.Join(pkg.Dir, file), nil, parser.ParseComments)
 		if err != nil {
@@ -641,7 +781,7 @@ func typeSpec(path string, typ Type, srcDir string) (Pkg, Spec, error) {
 			}
 		}
 	}
-	return Pkg{}, Spec{}, fmt.Errorf("type %s not found in %s", typ.Name, path)
+	return Pkg{}, Spec{}, fmt.Errorf("type %s not found in %s", typ.Name, typ.Path.Path)
 }
 
 // matchTypeParams returns a map of type parameters from a parsed interface
@@ -649,11 +789,11 @@ func typeSpec(path string, typ Type, srcDir string) (Pkg, Spec, error) {
 // info. If the passed params can't be used to fill the type parameters on the
 // passed type, a nil map and false are returned. No type checking is done,
 // only that there are sufficient types to match.
-func matchTypeParams(spec *ast.TypeSpec, params []string) (map[string]string, bool) {
+func matchTypeParams(spec *ast.TypeSpec, params []Type) (map[string]Type, bool) {
 	if spec.TypeParams == nil {
 		return nil, true
 	}
-	res := make(map[string]string, len(params))
+	res := make(map[string]Type, len(params))
 	var specParamNames []string
 	for _, typeParam := range spec.TypeParams.List {
 		for _, name := range typeParam.Names {
@@ -705,26 +845,30 @@ func (p Pkg) fullType(e ast.Expr) string {
 	return p.gofmt(e)
 }
 
-func (p Pkg) params(field *ast.Field, typeParams map[string]string) []Param {
+func (p Pkg) params(field *ast.Field, typeParams map[string]Type) []Param {
 	var params []Param
-	var typ string
-	switch expr := field.Type.(type) {
-	case *ast.Ident:
-		if genType, ok := typeParams[expr.Name]; ok {
-			typ = genType
-		} else {
-			typ = p.fullType(field.Type)
-		}
-	default:
-		typ = p.fullType(field.Type)
-	}
-	for _, name := range field.Names {
-		params = append(params, Param{Name: name.Name, Type: typ})
-	}
-	// Handle anonymous params
-	if len(params) == 0 {
-		params = []Param{{Type: typ}}
-	}
+	//var typ Type
+	//switch expr := field.Type.(type) {
+	//case *ast.Ident:
+	//	if genType, ok := typeParams[expr.Name]; ok {
+	//		typ = genType
+	//	} else {
+	//		// TODO:
+	//		//typ = p.fullType(field.Type)
+	//	}
+	//default:
+	//// TODO:
+	//	//typ = p.fullType(field.Type)
+	//}
+	////for _, name := range field.Names {
+	////	// TODO:
+	////	//params = append(params, Param{Name: name.Name, Type: typ})
+	////}
+	//// Handle anonymous params
+	//if len(params) == 0 {
+	//	// TODO:
+	//	//params = []Param{{Type: typ}}
+	//}
 	return params
 }
 
@@ -756,7 +900,7 @@ const (
 	WithoutComments EmitComments = false
 )
 
-func (p Pkg) funcsig(f *ast.Field, typeParams map[string]string, cmap ast.CommentMap, comments EmitComments) Func {
+func (p Pkg) funcsig(f *ast.Field, typeParams map[string]Type, cmap ast.CommentMap, comments EmitComments) Func {
 	fn := Func{Name: f.Names[0].Name}
 	typ := f.Type.(*ast.FuncType)
 	if typ.Params != nil {
@@ -798,13 +942,13 @@ func funcs(iface, srcDir, recvPkg string, comments EmitComments) ([]Func, error)
 	}
 
 	// Locate the interface.
-	path, typ, err := findInterface(iface, srcDir)
+	typ, err := findInterface(iface, srcDir)
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse the package and find the interface declaration.
-	p, spec, err := typeSpec(path[0].Path, typ, srcDir)
+	p, spec, err := typeSpec(typ, srcDir)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s not found: %s", iface, err)
 	}
@@ -962,7 +1106,7 @@ to prevent shell globbing.
 		recvs := strings.Fields(recv)
 		receiver := recvs[len(recvs)-1] // note that this correctly handles "s *Struct" and "*Struct"
 		receiver = strings.TrimPrefix(receiver, "*")
-		pkg, _, err := typeSpec("", Type{Name: receiver}, *flagSrcDir)
+		pkg, _, err := typeSpec(Type{Name: receiver}, *flagSrcDir)
 		if err == nil {
 			recvPkg = pkg.Package.Name
 		}
